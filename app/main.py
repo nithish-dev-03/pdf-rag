@@ -16,7 +16,11 @@ from app.services.embeddings import (
     generate_embeddings,
     generate_query_embedding,
 )
-from app.services.generator import generate_answer, refine_user_query
+from app.services.generator import (
+    generate_answer,
+    refine_user_query,
+    generate_hypothetical_document,
+)
 from app.services.vector_store import (
     save_chunks_to_postgres,
     search_similar_chunks,
@@ -96,17 +100,50 @@ def ingestion(pdf_path: Path = DEFAULT_PDF) -> None:
 def retrieval_and_generation(
     question: str | None = None,
     limit: int = RETRIEVAL_LIMIT,
+    rag_type: str = "naive",
+    refine: bool = REFINE_QUERY,
 ) -> None:
+
+    # 1. Get user question
     question = (question or input("Enter your question : \n")).strip()
+
     if not question:
         raise SystemExit("No question provided.")
 
-    search_text = refine_user_query(question) if REFINE_QUERY else question
-    if REFINE_QUERY and search_text != question:
+    # 2. Refine the original query (optional)
+    search_text = refine_user_query(question) if refine else question
+
+    if refine and search_text != question:
         print(f"\nSearch query: {search_text}")
 
-    query_vector = generate_query_embedding(search_text)
-    relevant_chunks = search_similar_chunks(query_vector, limit=limit)
+    print(f"\nQuery Refinement: {'Enabled' if refine else 'Disabled'}")
+
+    # 3. Select RAG strategy
+    match rag_type:
+
+        case "naive":
+            print("\nRAG Strategy: Naive RAG")
+
+            query_vector = generate_query_embedding(search_text)
+
+        case "hyde":
+            print("\nRAG Strategy: HyDE RAG")
+
+            hypothetical_document = generate_hypothetical_document(search_text)
+
+            print("\nGenerated Hypothetical Document:")
+            print(hypothetical_document)
+
+            query_vector = generate_query_embedding(hypothetical_document)
+
+        case _:
+            raise ValueError(f"Unsupported RAG strategy: {rag_type}")
+
+    # 4. Retrieve relevant chunks from vector database
+    relevant_chunks = search_similar_chunks(
+        query_vector,
+        limit=limit,
+    )
 
     if not relevant_chunks:
         print(
@@ -115,14 +152,19 @@ def retrieval_and_generation(
         )
         return
 
+    # 5. Display retrieved context
     print("\nRetrieved context:")
+
     for chunk in relevant_chunks:
         print(
             f"  - {chunk['source']} page {chunk['page']} "
-            f"chunk {chunk['chunk_index']} (distance {chunk['distance']:.4f})"
+            f"chunk {chunk['chunk_index']} "
+            f"(distance {chunk['distance']:.4f})"
         )
 
+    # 6. Generate final answer using original user question
     print("\nGenerating answer...")
+
     answer = generate_answer(question, relevant_chunks)
 
     print("\n--- Final Answer ---")
@@ -151,7 +193,21 @@ def build_parser() -> argparse.ArgumentParser:
     ask = subparsers.add_parser("ask", help="ask a question about ingested data")
     ask.add_argument("question", nargs="?", help="question (prompted if omitted)")
     ask.add_argument("--limit", type=int, default=RETRIEVAL_LIMIT)
+    ask.add_argument(
+        "--refine",
+        type=lambda value: value.lower() == "true",
+        choices=[True, False],
+        default=REFINE_QUERY,
+        help="Enable or disable query refinement",
+    )
 
+    # RAG strategy selection
+    ask.add_argument(
+        "--rag",
+        choices=["naive", "hyde"],
+        default="naive",
+        help="RAG retrieval strategy",
+    )
     subparsers.add_parser("check", help="check that the API key and chat model work")
 
     return parser
@@ -166,12 +222,16 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if command == "ingest":
             ingestion(args.pdf)
+
         elif command == "check":
             check_api_key()
+
         else:
             retrieval_and_generation(
-                getattr(args, "question", None),
-                getattr(args, "limit", RETRIEVAL_LIMIT),
+                question=getattr(args, "question", None),
+                limit=getattr(args, "limit", RETRIEVAL_LIMIT),
+                rag_type=getattr(args, "rag", "naive"),
+                refine=getattr(args, "refine", REFINE_QUERY),
             )
     except (ValueError, RuntimeError) as exc:
         raise SystemExit(f"Error: {exc}") from exc

@@ -26,6 +26,20 @@ SYSTEM_INSTRUCTION = (
     "Keep the answer concise, structured, and grounded strictly in the context."
 )
 
+
+
+HYDE_INSTRUCTION = """
+Generate a hypothetical document passage that could answer
+the user's question.
+
+Requirements:
+- Write as if this were a passage from a relevant policy document.
+- Include relevant concepts, conditions, and terminology.
+- Do not mention that this is a hypothetical passage.
+- Do not add explanations outside the passage.
+- Do not claim that the passage represents an actual policy.
+"""
+
 REFINE_INSTRUCTION = (
     "Rewrite the user's question as a clear, standalone search query for a "
     "document retrieval system. Keep every name, number, date and domain term "
@@ -76,3 +90,27 @@ def refine_user_query(user_query: str) -> str:
     refined = (response.text or "").strip()
     # Never let a garbled rewrite turn into an empty search query.
     return refined or user_query
+
+def generate_hypothetical_document(question: str) -> str:
+    client = create_client()
+
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=f"""
+        User question:
+        {question}
+
+        Generate a hypothetical document passage relevant to this question.
+        """,
+        config=types.GenerateContentConfig(
+            system_instruction=HYDE_INSTRUCTION,
+            temperature=0.3,
+        ),
+    )
+
+    hypothetical_document = (response.text or "").strip()
+
+    if not hypothetical_document:
+        return question
+
+    return hypothetical_document
