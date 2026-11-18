@@ -1,52 +1,74 @@
 # pdf-rag-gemini — RAG over a PDF with the Google Gen AI SDK
 
 A command-line Retrieval-Augmented Generation pipeline that ingests a PDF into
-PostgreSQL/pgvector and answers questions about it with Gemini, using the
-official `google-genai` SDK.
+PostgreSQL/pgvector, extracts a lightweight knowledge graph with Gemini, and
+answers questions about it — using the official `google-genai` SDK.
 
 ```
-ingest:  PDF -> text per page -> 500-char chunks -> embeddings -> PostgreSQL
-ask:     question -> (optional rewrite) -> query embedding -> cosine search -> Gemini answer
+ingest:  PDF -> text per page -> 500-char chunks -> embeddings ----------> document_chunks_gemini
+                                              \-> entities + relationships -> graph_facts
+ask:     question -> (optional rewrite) -> naive | HyDE | graph -> top-k chunks -> Gemini answer
 ```
+
+Three retrieval strategies ship with the CLI: **naive RAG** (embed the
+question), **HyDE** (embed a hypothetical answer passage instead of the
+question), and **graph** (match entities and walk one relationship hop).
 
 ## Architecture at a glance
 
-The system is two pipelines that meet at one table. Ingestion writes vectors;
-asking reads them. Nothing about a question is stored, and nothing about the
-document is re-embedded at query time.
+The system is two pipelines that meet at one database. Ingestion writes vectors
+and graph rows; asking reads either the vectors or the graph. Nothing about a
+question is stored, and nothing about the document is re-embedded at query time.
 
 ```mermaid
 flowchart LR
-    subgraph ING["① Ingestion — python -m app.main ingest"]
+    subgraph ING["① Ingestion — pdf-rag ingest"]
         direction TB
         PDF["PDF<br/>app/data/*.pdf"]
         EXT["get_context()<br/>pypdf: text per page"]
         CHUNK["chunk_text()<br/>500 chars, 100 overlap"]
         EMB["generate_embeddings()<br/>gemini-embedding-2, batch 32"]
         UPS["save_chunks_to_postgres()<br/>idempotent upsert"]
+        EXTRACT["extract_graph_data()<br/>entities + relationships per chunk"]
+        GSAVE["save_graph_data()<br/>delete + rewrite a chunk's facts"]
 
         PDF --> EXT --> CHUNK --> EMB --> UPS
+        CHUNK --> EXTRACT --> GSAVE
     end
 
     subgraph DB["② Storage — PostgreSQL 16 + pgvector"]
         TBL[("document_chunks_gemini<br/>id · content · embedding vector(1536)<br/>embedding_model · source · page · chunk_index")]
+        GTBL[("graph_facts<br/>chunk_id · entity · entity_type<br/>relation · related_entity")]
     end
 
-    subgraph ASK["③ Ask — python -m app.main ask"]
+    subgraph ASK["③ Ask — pdf-rag ask"]
         direction TB
         Q["Question"]
         REW["refine_user_query()<br/>optional standalone rewrite"]
-        QEMB["generate_query_embedding()<br/>question-answering prefix"]
+        STRAT{"--rag"}
+        NAIVE["naive<br/>embed the question"]
+        HYDE["hyde<br/>embed a hypothetical passage"]
+        GRAPH["graph<br/>match entity names<br/>+ one hop"]
         SEARCH["search_similar_chunks()<br/>cosine distance, top-k"]
         GEN["generate_answer()<br/>gemini-3.5-flash-lite"]
         ANS["Answer + page citations"]
 
-        Q --> REW --> QEMB --> SEARCH --> GEN --> ANS
+        Q --> REW --> STRAT
+        STRAT -->|naive| NAIVE --> SEARCH
+        STRAT -->|hyde| HYDE --> SEARCH
+        STRAT -->|graph| GRAPH --> SEARCH
+        SEARCH --> GEN --> ANS
     end
 
     UPS --> TBL
+    GSAVE --> GTBL
+    GTBL --> GRAPH
     TBL --> SEARCH
 ```
+
+The graph is stored in a single flat table, `graph_facts`, and is queried by
+`--rag graph`: entity matching finds the chunks that mention the question's
+entities, and one relationship hop adds their neighbours.
 
 ### Ingestion pipeline
 
@@ -66,7 +88,15 @@ flowchart TD
     K --> H
     I -- "ok" --> L["INSERT ... ON CONFLICT DO NOTHING<br/>(source, page, chunk_index)"]
     L --> M[("PostgreSQL<br/>document_chunks_gemini")]
+
+    F --> N["extract_graph_data()<br/>Gemini JSON extraction per chunk"]
+    N --> O["entities + relationships<br/>deduplicated by canonical name"]
+    O --> P[("graph_facts<br/>one row per fact")]
 ```
+
+Both stages are independent: `--skip-embeddings` runs only the graph stage
+against chunks already in the vector table, and `--skip-graph` runs only the
+embedding stage.
 
 ### Ask pipeline (retrieval → generation)
 
@@ -78,30 +108,79 @@ sequenceDiagram
     participant G as generator.py
     participant E as embeddings.py
     participant V as vector_store.py
+    participant R as graph_retriever.py
     participant PG as PostgreSQL/pgvector
     participant GM as Gemini API
 
-    U->>CLI: ask "question" --limit k
-    alt REFINE_QUERY = True
+    U->>CLI: ask "question" --limit k --rag naive|hyde|graph --refine true|false
+    alt refine = true
         CLI->>G: refine_user_query(question)
         G->>GM: rewrite prompt
         GM-->>G: standalone search query
         G-->>CLI: refined query
     end
-    CLI->>E: generate_query_embedding(search_text)
-    E->>GM: embed "task: question answering | query: ..."
-    GM-->>E: vector(1536)
-    E-->>CLI: query vector
-    CLI->>V: search_similar_chunks(vector, limit=k)
-    V->>PG: ORDER BY embedding <=> query<br/>WHERE embedding_model = ...
-    PG-->>V: k nearest chunks + distance
-    V-->>CLI: list of chunks
+    alt rag = graph
+        CLI->>R: retrieve_graph_chunks(search_text, limit=k)
+        R->>GM: extract_query_entities(question)
+        GM-->>R: entity names
+        R->>PG: match graph_facts<br/>direct mentions (score 3) + one hop (score 1)
+        PG-->>R: ranked chunk ids
+        R-->>CLI: chunks + graph_score
+    else rag = hyde
+        CLI->>G: generate_hypothetical_document(search_text)
+        G->>GM: hypothetical passage prompt
+        GM-->>G: hypothetical policy passage
+        G-->>CLI: passage
+        CLI->>E: generate_query_embedding(passage)
+        E->>GM: embed "task: question answering | query: ..."
+        GM-->>E: vector(1536)
+        E-->>CLI: query vector
+        CLI->>V: search_similar_chunks(vector, limit=k)
+        V->>PG: ORDER BY embedding <=> query<br/>WHERE embedding_model = ...
+        PG-->>V: k nearest chunks + distance
+        V-->>CLI: list of chunks
+    else rag = naive
+        CLI->>E: generate_query_embedding(search_text)
+        E->>GM: embed "task: question answering | query: ..."
+        GM-->>E: vector(1536)
+        E-->>CLI: query vector
+        CLI->>V: search_similar_chunks(vector, limit=k)
+        V->>PG: ORDER BY embedding <=> query<br/>WHERE embedding_model = ...
+        PG-->>V: k nearest chunks + distance
+        V-->>CLI: list of chunks
+    end
     CLI->>G: generate_answer(question, chunks)
     G->>GM: context + question
     GM-->>G: answer
     G-->>CLI: answer text
     CLI-->>U: retrieved context + answer
 ```
+
+### Retrieval strategies
+
+| Strategy | Query representation | Retrieval signal | Extra chat calls | Best for |
+|---|---|---|---|---|
+| `naive` (default) | the question (optionally rewritten) | cosine distance | 0 | direct, keyword-like questions |
+| `hyde` | a hypothetical policy passage the model writes about the question | cosine distance | 1 | vague or short questions whose wording differs from the document |
+| `graph` | entity names extracted from the question | exact name match + one relationship hop | 1 | questions about named things and how they relate |
+
+HyDE trades latency for recall: a passage-shaped query sits closer to document
+passages in embedding space than a terse question does. It also trades accuracy
+for recall — a hallucinated passage can pull retrieval toward the wrong topic,
+so `--rag naive` remains the default.
+
+Graph retrieval ignores embeddings entirely. Scores are simple to reason
+about:
+
+| Score | Meaning |
+|---|---|
+| `3` | the chunk mentions a matched entity (`+1` for every extra matched entity in the same chunk) |
+| `+1` | the chunk contains a relationship that connects **two** matched entities |
+| `1` | the chunk mentions a one-hop neighbour of a matched entity |
+
+Ties keep document order.
+
+
 
 ## What the retrieval limit does
 
@@ -114,6 +193,11 @@ It is a query-time knob only. It does **not** change chunking, embeddings, or
 what is stored in the database. It also does **not** act as a quality filter —
 there is no similarity threshold, so search always returns exactly `k` chunks
 (unless fewer rows exist), best-first by cosine distance.
+
+With `--rag graph` the same `--limit` still caps the number of chunks sent to
+the model, but ranking is by `graph_score` (direct mention vs one hop) rather
+than distance.
+
 
 The limit sets the ceiling on what the model can know. If the sentence that
 answers the question lives in a chunk that ranks `k+1`, it is invisible to the
@@ -146,9 +230,9 @@ correctly, citing page 3.
 | Too high | Context dilution: unrelated chunks compete for attention, token cost and latency rise, and answers can drift. |
 
 Raising `k` is a blunt fix. Better recall comes from coherent sentence-based
-chunks, whitespace normalisation, and **hybrid search** (pgvector + Postgres
-full-text) so exact terms such as `LOP`, `Casual Leave`, and `weekend` are not
-missed by dense similarity alone.
+chunks, whitespace normalisation, **HyDE** (`--rag hyde`), and **hybrid search**
+(pgvector + Postgres full-text) so exact terms such as `LOP`, `Casual Leave`, and
+`weekend` are not missed by dense similarity alone.
 
 ## Requirements
 
@@ -159,7 +243,9 @@ missed by dense similarity alone.
 
 The `DocumentChunkModel` table is created on the first ingest. It is named
 `document_chunks_gemini`, so this project can share a database with other
-ingest projects without vector-dimension conflicts.
+ingest projects without vector-dimension conflicts. The graph table,
+`graph_facts`, is created on the first graph ingest, and every ingest also
+creates the `vector` extension if it is missing.
 
 > **Note:** if you get `Could not enable the PostgreSQL 'vector' extension`, the
 > message may be masking a different failure. Verify the database itself exists:
@@ -218,8 +304,17 @@ python -m app.main check
 uv run pdf-rag check
 
 # chunk + embed + store the PDF from PDF_PATH (default: ms-leave-policy.pdf)
+# this also extracts entities/relationships and fills the graph tables
 python -m app.main ingest
 uv run pdf-rag ingest
+
+# only re-extract the graph, reusing chunks already stored in PostgreSQL
+python -m app.main ingest --skip-embeddings
+uv run pdf-rag ingest --skip-embeddings
+
+# only embed, without spending a chat call per chunk on graph extraction
+python -m app.main ingest --skip-graph
+uv run pdf-rag ingest --skip-graph
 
 # ingest a different PDF for one run
 python -m app.main ingest --pdf app/data/rag_chunking_sample.pdf
@@ -235,6 +330,18 @@ uv run pdf-rag ask
 # retrieve more than the default 5 chunks
 python -m app.main ask "What is the policy on probation?" --limit 4
 uv run pdf-rag ask "What is the policy on probation?" --limit 4
+
+# HyDE retrieval: embed a hypothetical answer passage instead of the question
+python -m app.main ask "Can I take Friday and Monday off?" --rag hyde
+uv run pdf-rag ask "Can I take Friday and Monday off?" --rag hyde
+
+# graph retrieval: match entity names and follow one relationship hop
+python -m app.main ask "Can casual leave be clubbed with sick leave?" --rag graph
+uv run pdf-rag ask "Can casual leave be clubbed with sick leave?" --rag graph
+
+# disable query refinement for a single question
+python -m app.main ask "What is LOP?" --refine false
+uv run pdf-rag ask "What is LOP?" --refine false
 ```
 
 Command reference:
@@ -244,13 +351,24 @@ Command reference:
 | Check API key / model | `python -m app.main check` | `uv run pdf-rag check` |
 | Ingest default PDF | `python -m app.main ingest` | `uv run pdf-rag ingest` |
 | Ingest a specific PDF | `python -m app.main ingest --pdf <path>` | `uv run pdf-rag ingest --pdf <path>` |
+| Graph only (no re-embedding) | `python -m app.main ingest --skip-embeddings` | `uv run pdf-rag ingest --skip-embeddings` |
+| Embeddings only (no graph) | `python -m app.main ingest --skip-graph` | `uv run pdf-rag ingest --skip-graph` |
 | Ask a question | `python -m app.main ask "<question>"` | `uv run pdf-rag ask "<question>"` |
 | Ask interactively | `python -m app.main ask` | `uv run pdf-rag ask` |
 | Override top-k | `python -m app.main ask "<question>" --limit 4` | `uv run pdf-rag ask "<question>" --limit 4` |
+| Choose retrieval strategy | `python -m app.main ask "<question>" --rag hyde` | `uv run pdf-rag ask "<question>" --rag hyde` |
+| Graph retrieval | `python -m app.main ask "<question>" --rag graph` | `uv run pdf-rag ask "<question>" --rag graph` |
+| Toggle query refinement | `python -m app.main ask "<question>" --refine false` | `uv run pdf-rag ask "<question>" --refine false` |
 
-Ingestion is idempotent on `(source, page, chunk_index)`, so re-running it does
-not duplicate rows. The bundled policy PDF produces 6 pages / 33 chunks. The
+Vector ingestion is idempotent on `(source, page, chunk_index)`, so re-running it
+does not duplicate rows. The bundled policy PDF produces 6 pages / 33 chunks. The
 progress line `Embedded 32 of 33 chunks.` is just batch reporting, not an error.
+
+Graph extraction is **not** free: every run makes one chat request per chunk
+(33 for the bundled PDF). The writer deletes and rewrites a chunk's facts before
+inserting, so re-running never duplicates rows — it only costs API calls. Use
+`--skip-embeddings` when you only want to rebuild the graph, and `--skip-graph`
+when you only want vectors.
 
 ## Configuration
 
@@ -263,7 +381,12 @@ All settings live in `app/core/config.py`.
 | `EMBEDDING_DIM` | `1536` | recommended size; must match the DB column |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `500` / `100` | characters |
 | `TABLE_NAME` | `document_chunks_gemini` | dedicated table, safe to share a database |
-| `REFINE_QUERY` | `True` | rewrite the question with the chat model before embedding |
+| `REFINE_QUERY` | `True` | default for query rewriting; `--refine true/false` overrides per call |
+
+Graph settings are fixed in code (`app/services/graph/extractor.py`,
+`graph_store.py`): `gemini-3.5-flash-lite` at `temperature=0` with JSON response
+mode, entity names normalised to lowercase/collapsed whitespace, relationship
+types upper-cased. `graph_facts` is created on the first graph ingest.
 
 Environment knobs (read by `app/core/config.py`):
 
@@ -301,6 +424,36 @@ Unique constraint `(source, page, chunk_index)` makes re-ingest idempotent via
 `ON CONFLICT DO NOTHING`. Search filters on `embedding_model` so vectors from
 different models are never compared.
 
+### Graph table
+
+The whole knowledge graph lives in **one** flat table, `graph_facts`:
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | `integer` PK | surrogate key |
+| `chunk_id` | `integer` FK → `document_chunks_gemini.id` | the chunk the fact came from |
+| `entity` | `text` | subject of the fact, lowercased |
+| `entity_type` | `text` | e.g. `LEAVE_TYPE`, `ROLE`, `UNKNOWN` |
+| `relation` | `text NULL` | edge label; `NULL` when the row is a plain mention |
+| `related_entity` | `text NULL` | edge target; `NULL` when the row is a plain mention |
+
+Each row says *"this chunk talks about `entity`"*. When `relation` is filled it
+also says *"and `entity` is connected to `related_entity`"*:
+
+| chunk_id | entity | entity_type | relation | related_entity |
+|---|---|---|---|---|
+| 13 | casual leave | LEAVE_TYPE | NULL | NULL |
+| 13 | sick leave | LEAVE_TYPE | CANNOT_BE_CLUBBED_WITH | casual leave |
+
+Names are normalised (`strip().lower()` + collapsed whitespace), so
+"Casual Leave" and "casual  leave" match. No joins are needed: retrieval just
+filters the two text columns. The writer deletes a chunk's rows and rewrites
+them, which keeps re-ingestion idempotent. A record is skipped if its
+`(source, page, chunk_index)` is not in `document_chunks_gemini`.
+
+That makes **two tables in total** for the whole project: `document_chunks_gemini`
+for vectors and `graph_facts` for the graph.
+
 ## Project layout
 
 ```
@@ -311,10 +464,15 @@ pdf-rag-gemini/
 │   │   └── config.py      # models, dimensions, chunking, table name
 │   ├── services/
 │   │   ├── embeddings.py  # batched embeddings, query embeddings
-│   │   ├── generator.py   # query rewrite + answer generation
-│   │   └── vector_store.py# pgvector schema, idempotent upsert, cosine search
-│   ├── data/              # source PDFs
-│   └── main.py            # CLI orchestration
+│   │   ├── generator.py   # query rewrite, HyDE passages, answer generation
+│   │   ├── retriever.py   # naive / HyDE retrieval strategies
+│   │   ├── vector_store.py# pgvector schema, idempotent upsert, cosine search
+│   │   └── graph/
+│   │       ├── extractor.py      # per-chunk entity/relationship extraction
+│   │       ├── graph_store.py    # graph_facts schema + writer
+│   │       └── graph_retriever.py# entity match + one-hop retrieval
+│   ├── data/              # source PDFs (git-ignored)
+│   └── main.py            # CLI orchestration (ingest / ask / check)
 ├── .env.example
 ├── pyproject.toml
 └── uv.lock
@@ -336,7 +494,26 @@ pdf-rag-gemini/
 - **Embedding-model changes require a re-ingest.** Vectors from different
   models are not comparable; the search filters on `embedding_model`, but old
   rows should still be cleared or re-embedded.
-- **`REFINE_QUERY`** adds one chat request per question. Set it to `False` to
-  embed the user's wording verbatim if the rewrite ever hurts recall.
+- **`REFINE_QUERY`** adds one chat request per question. Set it to `False` (or
+  pass `--refine false`) to embed the user's wording verbatim if the rewrite
+  ever hurts recall.
+- **HyDE adds another chat request** and can hallucinate a passage that pulls
+  retrieval toward the wrong topic. It usually helps vague questions and can
+  hurt precise ones; compare `--rag naive` against `--rag hyde` on your own
+  questions before switching defaults.
+- **Graph extraction costs one chat call per chunk** and is the slowest stage
+  for large PDFs. It is skipped with `--skip-graph` and can be run alone with
+  `--skip-embeddings`.
+- **Graph retrieval has no vector fallback.** `--rag graph` makes one chat call
+  to extract entities, then matches them by text. If nothing matches (a synonym,
+  a paraphrase, an entity the extractor missed) it returns no chunks instead of
+  falling back to similarity search.
+- **Graph matches are exact substrings.** `CL` and `Casual Leave`, or `LOP` and
+  `Loss of Pay`, are separate names. Add an alias map if synonyms matter.
+- **Graph ties keep document order.** The score is built from entity overlap and
+  edge evidence only, so many chunks can tie; a secondary relevance signal
+  (embedding distance) is the obvious next improvement.
+- **Relationship extraction is per chunk.** Edges spanning two chunks are not
+  discovered, because both endpoints must appear in the same extraction result.
 - The answer prompt instructs the model to reply "I cannot find the answer in
   the provided document." when the retrieved context is insufficient.

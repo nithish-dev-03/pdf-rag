@@ -25,6 +25,9 @@ from app.services.vector_store import (
     save_chunks_to_postgres,
     search_similar_chunks,
 )
+from app.services.graph.extractor import extract_graph_data
+from app.services.graph.graph_store import save_graph_data
+from app.services.graph.graph_retriever import retrieve_graph_chunks
 
 DEFAULT_PDF = PDF_PATH
 
@@ -88,13 +91,86 @@ def chunk_text(documents: list[dict]) -> list[dict]:
     return chunks
 
 
-def ingestion(pdf_path: Path = DEFAULT_PDF) -> None:
+
+def load_chunks(pdf_path: Path) -> list[dict]:
+    """Extract and chunk a PDF, returning [] when it has no usable text."""
     documents = get_context(pdf_path)
     chunks = chunk_text(documents)
-    print(f"Extracted {len(documents)} pages and {len(chunks)} chunks from {pdf_path.name}.")
 
-    embeddings = generate_embeddings(chunks)
-    save_chunks_to_postgres(embeddings)
+    if not chunks:
+        print("No text chunks found in the PDF.")
+
+    return chunks
+
+
+def ingest_vector_store(chunks: list[dict]) -> int:
+    """Embed chunks and upsert them into PostgreSQL/pgvector."""
+    embedded_chunks = generate_embeddings(chunks)
+    saved_count = save_chunks_to_postgres(embedded_chunks)
+
+    print(f"Saved {saved_count} vector chunks.")
+
+    return saved_count
+
+
+def ingest_knowledge_graph(chunks: list[dict]) -> int:
+    """Extract entities/relationships per chunk and store them in the graph tables."""
+    graph_records = []
+
+    for index, chunk in enumerate(chunks, start=1):
+        print(f"Extracting graph data: {index}/{len(chunks)}")
+
+        metadata = chunk["metadata"]
+
+        extracted = extract_graph_data(chunk["content"])
+
+        graph_records.append({
+            "source": metadata["source"],
+            "page": metadata["page"],
+            # chunk_text() stores the per-page index under "chunk"; the
+            # vector store renames it to "chunk_index" when inserting rows.
+            "chunk_index": metadata["chunk"],
+            "entities": extracted["entities"],
+            "relationships": extracted["relationships"],
+        })
+
+    graph_saved_count = save_graph_data(graph_records)
+
+    print(
+        f"Graph ingestion completed. "
+        f"Processed {graph_saved_count} chunks."
+    )
+
+    if graph_records and graph_saved_count == 0:
+        print(
+            "Warning: no chunks were matched in the vector store. "
+            "Run ingestion without --skip-embeddings first."
+        )
+
+    return graph_saved_count
+
+
+def ingestion(
+    pdf_path: Path = DEFAULT_PDF,
+    skip_embeddings: bool = False,
+    skip_graph: bool = False,
+) -> None:
+    """Run the ingestion stages, each of which can be skipped independently."""
+    chunks = load_chunks(pdf_path)
+
+    if not chunks:
+        return
+
+    if skip_embeddings:
+        print("Skipping embeddings: using the chunks already in PostgreSQL.")
+    else:
+        ingest_vector_store(chunks)
+
+    if skip_graph:
+        print("Skipping graph extraction.")
+    else:
+        ingest_knowledge_graph(chunks)
+
 
 
 def retrieval_and_generation(
@@ -119,6 +195,8 @@ def retrieval_and_generation(
     print(f"\nQuery Refinement: {'Enabled' if refine else 'Disabled'}")
 
     # 3. Select RAG strategy
+    
+    # 3. Select RAG strategy
     match rag_type:
 
         case "naive":
@@ -129,46 +207,67 @@ def retrieval_and_generation(
         case "hyde":
             print("\nRAG Strategy: HyDE RAG")
 
-            hypothetical_document = generate_hypothetical_document(search_text)
+            hypothetical_document = generate_hypothetical_document(
+                search_text
+            )
 
             print("\nGenerated Hypothetical Document:")
             print(hypothetical_document)
 
-            query_vector = generate_query_embedding(hypothetical_document)
+            query_vector = generate_query_embedding(
+                hypothetical_document
+            )
+
+        case "graph":
+            print("\nRAG Strategy: Graph RAG")
+
+            relevant_chunks = retrieve_graph_chunks(
+                search_text,
+                limit=limit,
+            )
 
         case _:
-            raise ValueError(f"Unsupported RAG strategy: {rag_type}")
+            raise ValueError(
+                f"Unsupported RAG strategy: {rag_type}"
+            )
 
-    # 4. Retrieve relevant chunks from vector database
-    relevant_chunks = search_similar_chunks(
-        query_vector,
-        limit=limit,
-    )
+    # 4. Vector retrieval for Naive and HyDE.
+    if rag_type in ("naive", "hyde"):
+        relevant_chunks = search_similar_chunks(
+            query_vector,
+            limit=limit,
+        )
 
     if not relevant_chunks:
-        print(
-            "\nNo chunks found. Run `python -m app.main ingest` first "
-            "or lower the requested limit."
-        )
+        print("\nNo relevant chunks found.")
         return
 
-    # 5. Display retrieved context
+    # 5. Display retrieved context.
     print("\nRetrieved context:")
 
     for chunk in relevant_chunks:
+        distance = chunk.get("distance")
+
+        retrieval_info = (
+            f"(distance {distance:.4f})"
+            if distance is not None
+            else f"(graph score {chunk.get('graph_score', 0)})"
+        )
+
         print(
             f"  - {chunk['source']} page {chunk['page']} "
             f"chunk {chunk['chunk_index']} "
-            f"(distance {chunk['distance']:.4f})"
+            f"{retrieval_info}"
         )
 
-    # 6. Generate final answer using original user question
+    # 6. Generate answer using original user question.
     print("\nGenerating answer...")
 
     answer = generate_answer(question, relevant_chunks)
 
     print("\n--- Final Answer ---")
     print(answer)
+
 
 
 def check_api_key() -> None:
@@ -189,6 +288,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="chunk, embed and store a PDF")
     ingest.add_argument("--pdf", type=Path, default=DEFAULT_PDF)
+    ingest.add_argument(
+        "--skip-embeddings",
+        action="store_true",
+        help="reuse the chunks already stored in PostgreSQL (graph extraction only)",
+    )
+    ingest.add_argument(
+        "--skip-graph",
+        action="store_true",
+        help="only embed and store chunks, without extracting graph data",
+    )
 
     ask = subparsers.add_parser("ask", help="ask a question about ingested data")
     ask.add_argument("question", nargs="?", help="question (prompted if omitted)")
@@ -204,7 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     # RAG strategy selection
     ask.add_argument(
         "--rag",
-        choices=["naive", "hyde"],
+        choices=["naive", "hyde", "graph"],
         default="naive",
         help="RAG retrieval strategy",
     )
@@ -221,7 +330,11 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         if command == "ingest":
-            ingestion(args.pdf)
+            ingestion(
+                args.pdf,
+                skip_embeddings=args.skip_embeddings,
+                skip_graph=args.skip_graph,
+            )
 
         elif command == "check":
             check_api_key()
